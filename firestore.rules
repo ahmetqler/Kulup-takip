@@ -1,0 +1,172 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    function memberDoc(clubId) {
+      return get(/databases/$(database)/documents/clubs/$(clubId)/members/$(request.auth.uid));
+    }
+    function isMember(clubId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/clubs/$(clubId)/members/$(request.auth.uid))
+        && memberDoc(clubId).data.active == true;
+    }
+    function isAdmin(clubId) {
+      return isMember(clubId) && memberDoc(clubId).data.isAdmin == true;
+    }
+    /* Başkan Yardımcısı: görev/etkinlik yönetiminde birim sınırı olmaksızın
+       Başkan'la aynı yetkiye sahiptir (üye/kulüp ayarlarına dokunamaz). */
+    function isViceAdmin(clubId) {
+      return isMember(clubId) && memberDoc(clubId).data.get('role', '') == 'Başkan Yardımcısı';
+    }
+    function clubOwner(clubId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/clubs/$(clubId)).data.createdBy == request.auth.uid;
+    }
+    /* Platform yöneticisi: platformAdmins/{uid} belgesinin VARLIĞI yeterli
+       (bkz. aşağıdaki match bloğu — o koleksiyona hiçbir client write yapamaz,
+       sadece Firebase Console'dan elle eklenir). Tüm kulüpleri görme/silme
+       yetkisi verir, normal kulüp-bazlı isAdmin'den tamamen ayrı bir kavramdır. */
+    function isPlatformAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/platformAdmins/$(request.auth.uid));
+    }
+
+    /* Birim (departman) yardımcıları. .get(key, default) kullanıyoruz
+       çünkü unitId/isUnitHead alanları bu özellikten önce oluşturulmuş
+       belgelerde olmayabilir — eksikse hata vermek yerine varsayılana düşer. */
+    function myUnit(clubId) {
+      return isMember(clubId) ? memberDoc(clubId).data.get('unitId', null) : null;
+    }
+    function amUnitHead(clubId) {
+      return isMember(clubId)
+        && memberDoc(clubId).data.get('isUnitHead', false) == true
+        && memberDoc(clubId).data.get('unitId', null) != null;
+    }
+
+    /* "Hangi kulüplere üyeyim?" sorgusu tüm kulüplerin members alt
+       koleksiyonlarını tek seferde tarar (collection group query).
+       Firestore'da bu tür sorgular için AYRI bir kural gerekir —
+       yukarıdaki /clubs/{clubId}/members/{uid} kuralı bu sorgu türünü
+       kapsamaz. Sadece kendi belgesini (uid alanı kendisiyle eşleşen)
+       döndürmesine izin verir, başkasının üyeliklerini listeleyemez. */
+    match /{path=**}/members/{uid} {
+      allow list: if request.auth != null && resource.data.uid == request.auth.uid;
+    }
+
+    /* Platform yöneticisi işareti. write:false → hiç kimse (yönetici dahil)
+       kendini veya başkasını buraya client'tan ekleyemez/çıkaramaz; SADECE
+       Firebase Console'un Firestore veri ekranından elle yönetilir. get, sadece
+       kendi belgeni okuyabilmen için (uygulamanın "bu hesap platform admini mi"
+       kontrolü bunu kullanır) — başkasının admin olup olmadığını göremezsin. */
+    match /platformAdmins/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow write: if false;
+    }
+
+    /* Davet kodu -> kulüp eşlemesi. "list" kapalı: kimse tüm kodları
+       tarayamaz, sadece tam kodu bilen "get" yapabilir. */
+    match /inviteCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.clubId is string
+        && (clubOwner(request.resource.data.clubId) || isAdmin(request.resource.data.clubId));
+      allow delete: if signedIn() && (isAdmin(resource.data.clubId) || isPlatformAdmin());
+      allow update: if false;
+    }
+
+    match /clubs/{clubId} {
+      allow get: if isMember(clubId) || isPlatformAdmin();
+      allow list: if isPlatformAdmin();
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+        && request.resource.data.inviteCode is string;
+      allow update: if isAdmin(clubId) && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120;
+      /* Silme normalde kimseye açık değil (kulüp yöneticisi bile kendi kulübünü
+         silemez) — sadece platform yöneticisi, spam/kötüye kullanım durumunda. */
+      allow delete: if isPlatformAdmin();
+
+      /* Birimler (departmanlar). Sadece kulüp yöneticisi oluşturur/siler/adını değiştirir. */
+      match /units/{unitId} {
+        allow get, list: if isMember(clubId) || isPlatformAdmin();
+        allow create, update: if isAdmin(clubId)
+          && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120;
+        allow delete: if isAdmin(clubId) || isPlatformAdmin();
+      }
+
+      /* Üyelik belgesinin id'si = kullanıcının auth uid'si.
+         isAdmin:true sadece kulübü oluşturan kişi için (ilk kurulum anında) kabul edilir;
+         başkası kendini asla yönetici olarak ekleyemez. Katılım anında unitId/isUnitHead
+         her zaman boş başlar — birime atama sadece sonradan, yönetici ya da o birimin
+         başkanı tarafından yapılabilir. */
+      match /members/{uid} {
+        allow get: if isMember(clubId) || isPlatformAdmin();
+        allow list: if isMember(clubId) || isPlatformAdmin();
+        allow create: if signedIn() && uid == request.auth.uid
+          && request.resource.data.active == true
+          && request.resource.data.isAdmin is bool
+          && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+          && request.resource.data.get('unitId', null) == null
+          && request.resource.data.get('isUnitHead', false) == false
+          && (request.resource.data.isAdmin == false || clubOwner(clubId));
+        /* Yönetici her alanı değiştirebilir. Birim başkanı SADECE unitId/isUnitHead
+           alanlarını, SADECE kendi biriminden çıkan ya da kendi birimine giren
+           üyeler için değiştirebilir (başka bir birimdeki üyeye dokunamaz). */
+        allow update: if isAdmin(clubId)
+          || (
+            amUnitHead(clubId)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unitId','isUnitHead'])
+            && (resource.data.get('unitId', null) == null || resource.data.get('unitId', null) == myUnit(clubId))
+            && (request.resource.data.get('unitId', null) == myUnit(clubId) || request.resource.data.get('unitId', null) == null)
+          );
+        allow delete: if isAdmin(clubId) || isPlatformAdmin();
+      }
+
+      match /tasks/{taskId} {
+        allow get, list: if isMember(clubId) || isPlatformAdmin();
+        allow create: if (isAdmin(clubId) || isViceAdmin(clubId)
+            || (amUnitHead(clubId) && request.resource.data.get('unitId', null) == myUnit(clubId)))
+          && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 300;
+        allow delete: if isAdmin(clubId) || isViceAdmin(clubId)
+          || (amUnitHead(clubId) && resource.data.get('unitId', null) == myUnit(clubId))
+          || isPlatformAdmin();
+        /* Yönetici ve Başkan Yardımcısı her görevi değiştirebilir; kendi biriminin
+           görevinde birim başkanı da her şeyi değiştirebilir (birimi başka birime
+           taşıyamaz); atanan kişi sadece kendi görevinin durumunu değiştirebilir.
+           Başlık düzenleme yetkisi olan yollarda, create'teki gibi title yine
+           doğrulanır — yetkili biri boş/aşırı uzun başlıkla veriyi bozamasın. */
+        allow update: if ((isAdmin(clubId) || isViceAdmin(clubId)
+              || (amUnitHead(clubId)
+                  && resource.data.get('unitId', null) == myUnit(clubId)
+                  && request.resource.data.get('unitId', null) == myUnit(clubId)))
+              && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 300)
+          || (isMember(clubId) && resource.data.assigneeId == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','completedAt']));
+      }
+
+      match /events/{eventId} {
+        allow get, list: if isMember(clubId) || isPlatformAdmin();
+        allow create: if (isAdmin(clubId) || isViceAdmin(clubId)
+            || (amUnitHead(clubId) && request.resource.data.get('unitId', null) == myUnit(clubId)))
+          && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 300;
+        allow delete: if isAdmin(clubId) || isViceAdmin(clubId)
+          || (amUnitHead(clubId) && resource.data.get('unitId', null) == myUnit(clubId))
+          || isPlatformAdmin();
+        allow update: if (isAdmin(clubId) || isViceAdmin(clubId)
+            || (amUnitHead(clubId) && resource.data.get('unitId', null) == myUnit(clubId)))
+          && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 300;
+
+        match /attendance/{uid} {
+          allow get, list: if isMember(clubId) || isPlatformAdmin();
+          allow create, update, delete: if isAdmin(clubId) || isViceAdmin(clubId)
+            || (amUnitHead(clubId)
+                && get(/databases/$(database)/documents/clubs/$(clubId)/events/$(eventId)).data.get('unitId', null) == myUnit(clubId))
+            || isPlatformAdmin();
+        }
+      }
+    }
+  }
+}
